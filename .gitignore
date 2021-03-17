@@ -4,6 +4,7 @@
 !ddrive/**
 !export.py
 !geese.py
+!test_run.ipynb
 !ws.txt
 !ww.txt
 tutorials

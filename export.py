@@ -73,7 +73,7 @@ x = tf.zeros((7, 11, 4))
 
 net = Net([32, 32, 48, 48, 48, 48, 64, 64], NUM_ACT, x)
 net(net.stock)
-net.load_weights(f'ddrive\\{gen}c.h5')
+net.load_weights(f'ddrive/{gen}c.h5')
 
 with open('ww.txt', 'w') as f:
     f.write(json.dumps([base64.b64encode(arr.astype(np.half)).decode('ascii') for arr in net.get_weights()]))

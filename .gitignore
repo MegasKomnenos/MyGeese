@@ -3,7 +3,7 @@
 !*/
 !ddrive/**
 !export.py
-!geese.py!
+!geese.py
 tutorials
 src
 tensorflow-inference-tensorrt5-t4-gpu

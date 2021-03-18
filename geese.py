@@ -442,7 +442,8 @@ if __name__ == '__main__':
 
         with tqdm.tqdm(total=len(cg)) as pbar:
             for cs in cg:
-                tcg = CellGroup(cs, target)
+                #tcg = CellGroup(cs, target)
+                tcg = CellGroup(cs, critic)
                 
                 xs.extend(tcg.xs)
                 ys.extend(tcg.ys)

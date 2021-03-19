@@ -9,29 +9,19 @@ import base64
 
 NUM_ACT = 4
 
-class Residual(tf.keras.layers.Layer):
+class Block(tf.keras.layers.Layer):
     def __init__(self, flt, **kwargs):
-        super(Residual, self).__init__(**kwargs)
+        super(Block, self).__init__(**kwargs)
         
-        self.conv_0 = tf.keras.layers.Conv2D(flt, 3, padding='same', use_bias=False)
-        self.conv_1 = tf.keras.layers.Conv2D(flt, 3, padding='same', use_bias=False)
-        self.conv_2 = tf.keras.layers.Conv2D(flt, 1, padding='same')
-        self.bn_0 = tf.keras.layers.BatchNormalization()
-        self.bn_1 = tf.keras.layers.BatchNormalization()
+        self.dense = tf.keras.layers.Dense(flt, use_bias=False)
+        self.bn = tf.keras.layers.BatchNormalization()
         
     def call(self, inp, training=False):
-        if len(inp.shape) < 4:
-            inp = tf.expand_dims(inp, 0)
-            
-        x = self.conv_0(inp)
-        x = self.bn_0(x, training)
+        x = self.dense(inp)
+        x = self.bn(x, training)
         x = tf.nn.relu(x)
-        x = self.conv_1(x)
-        x = self.bn_1(x, training)
-        x = tf.nn.relu(x)
-        x += self.conv_2(inp)
         
-        return tf.nn.relu(x)
+        return x
 
 class Net(tf.keras.Model):
     def __init__(self, layers, out, stock):
@@ -43,10 +33,7 @@ class Net(tf.keras.Model):
         self.tower = []
 
         for l in layers:
-            if l == -1:
-                self.tower.append(tf.keras.layers.AveragePooling2D())
-            else:
-                self.tower.append(Residual(l))
+            self.tower.append(Block(l))
         
         self.flt = tf.keras.layers.Flatten()
         self.out = tf.keras.layers.Dense(out)
@@ -57,21 +44,22 @@ class Net(tf.keras.Model):
 
         if len(x.shape) < 4:
             x = tf.expand_dims(x, 0)
+            
+        x = self.flt(x)
 
         for block in self.tower:
             x = block(x, training=training)
-
-        x = self.flt(x)
+            
         x = self.out(x)
         x = self.act(x)
             
         return x
         
-gen = input()
+gen = int(input())
 
-x = tf.zeros((7, 11, 4))
+x = tf.zeros((7, 11, 6))
 
-net = Net([32, 32, 48, 48, 48, 48, 64, 64], NUM_ACT, x)
+net = Net([512, 128, 128, 32], NUM_ACT, x)
 net(net.stock)
 net.load_weights(f'ddrive/{gen}c.h5')
 

@@ -24,41 +24,33 @@ tcritic = None
 tgen = None
 
 NUM_GRID = (7, 11)
+NUM_CHANNEL = 6
 NUM_ACT = 4
 NUM_GEESE = 4
 
-GEN_ENDED_AT = -1
+GEN_ENDED_AT = int(input())
+GEN_ENDS_AT = int(input())
 GAME_PER_GEN = 400
 
 NUM_LAMBDA = 0.8
 NUM_P = 0.95
 
-STOCK_X = tf.convert_to_tensor(np.zeros((*NUM_GRID, 4)), dtype='float32')
+STOCK_X = tf.convert_to_tensor(np.zeros((*NUM_GRID, NUM_CHANNEL)), dtype='float32')
 STOCK_ACT = [Action(i + 1) for i in range(NUM_ACT)]
 
-class Residual(tf.keras.layers.Layer):
+class Block(tf.keras.layers.Layer):
     def __init__(self, flt, **kwargs):
-        super(Residual, self).__init__(**kwargs)
+        super(Block, self).__init__(**kwargs)
         
-        self.conv_0 = tf.keras.layers.Conv2D(flt, 3, padding='same', use_bias=False)
-        self.conv_1 = tf.keras.layers.Conv2D(flt, 3, padding='same', use_bias=False)
-        self.conv_2 = tf.keras.layers.Conv2D(flt, 1, padding='same')
-        self.bn_0 = tf.keras.layers.BatchNormalization()
-        self.bn_1 = tf.keras.layers.BatchNormalization()
+        self.dense = tf.keras.layers.Dense(flt, use_bias=False)
+        self.bn = tf.keras.layers.BatchNormalization()
         
     def call(self, inp, training=False):
-        if len(inp.shape) < 4:
-            inp = tf.expand_dims(inp, 0)
-            
-        x = self.conv_0(inp)
-        x = self.bn_0(x, training)
+        x = self.dense(inp)
+        x = self.bn(x, training)
         x = tf.nn.relu(x)
-        x = self.conv_1(x)
-        x = self.bn_1(x, training)
-        x = tf.nn.relu(x)
-        x += self.conv_2(inp)
         
-        return tf.nn.relu(x)
+        return x
 
 class Net(tf.keras.Model):
     def __init__(self, layers, out, stock):
@@ -70,10 +62,7 @@ class Net(tf.keras.Model):
         self.tower = []
 
         for l in layers:
-            if l == -1:
-                self.tower.append(tf.keras.layers.AveragePooling2D())
-            else:
-                self.tower.append(Residual(l))
+            self.tower.append(Block(l))
         
         self.flt = tf.keras.layers.Flatten()
         self.out = tf.keras.layers.Dense(out)
@@ -84,11 +73,12 @@ class Net(tf.keras.Model):
 
         if len(x.shape) < 4:
             x = tf.expand_dims(x, 0)
+            
+        x = self.flt(x)
 
         for block in self.tower:
             x = block(x, training=training)
-
-        x = self.flt(x)
+            
         x = self.out(x)
         x = self.act(x)
             
@@ -143,11 +133,11 @@ class Cell:
         return out
 
     def deser(dct):
-        dct['s'] = tf.convert_to_tensor(np.frombuffer(base64.decodebytes(dct['s'].encode('utf-8')), dtype=np.float32).reshape((*NUM_GRID, 4)))
+        dct['s'] = tf.convert_to_tensor(np.frombuffer(base64.decodebytes(dct['s'].encode('utf-8')), dtype=np.float32).reshape((*NUM_GRID, NUM_CHANNEL)))
         out = Cell(dct['s'], dct['a'], dct['r'])
 
         if 'ss' in dct:
-            out.ss = tf.convert_to_tensor(np.frombuffer(base64.decodebytes(dct['ss'].encode('utf-8')), dtype=np.float32).reshape((*NUM_GRID, 4)))
+            out.ss = tf.convert_to_tensor(np.frombuffer(base64.decodebytes(dct['ss'].encode('utf-8')), dtype=np.float32).reshape((*NUM_GRID, NUM_CHANNEL)))
         
         return out
 
@@ -165,13 +155,13 @@ class CellGroup:
                 indexs.append(i)
                 ss.append(c.ss)
 
-        for b in range(len(indexs) // 2048 + 1):
-            sss = tf.stack(ss[b * 2048:(b + 1) * 2048])
+        for b in range(len(indexs) // 8192 + 1):
+            sss = tf.stack(ss[b * 8192:(b + 1) * 8192])
             y = target(sss, training=True)
             y = tf.nn.relu(tf.reduce_max(y, axis=1))
             y *= NUM_LAMBDA
 
-            for i, ii in enumerate(indexs[b * 2048:(b + 1) * 2048]):
+            for i, ii in enumerate(indexs[b * 8192:(b + 1) * 8192]):
                 self.ys[ii] += y[i]
 
 class Goose:
@@ -179,10 +169,35 @@ class Goose:
         self.critic = critic
 
         self.cs = list()
-        self.act = None
+        self.heads = None
 
     def __call__(self, obs, _):
-        x = obs_to_x(obs, self.act)
+        acts = [None] * len(obs['geese'])
+        
+        if self.heads != None:
+            for i, head in enumerate(self.heads):
+                if head and obs['geese'][i]:
+                    r, c = pos_to_coord(head)
+                    rr, cc = pos_to_coord(obs['geese'][i][0])
+                    
+                    if (r - 1) % NUM_GRID[0] == rr:
+                        acts[i] = STOCK_ACT[0]
+                    elif (c + 1) % NUM_GRID[1] == cc:
+                        acts[i] = STOCK_ACT[1]
+                    elif (r + 1) % NUM_GRID[0] == rr:
+                        acts[i] = STOCK_ACT[2]
+                    elif (c - 1) % NUM_GRID[1] == cc:
+                        acts[i] = STOCK_ACT[3]
+        
+        self.heads = list()
+        
+        for goose in obs['geese']:
+            if goose:
+                self.heads.append(goose[0])
+            else:
+                self.heads.append(None)
+            
+        x = obs_to_x(obs, acts)
 
         scores = [float(score) + 0.1 for score in tf.nn.relu(self.critic(x))[0]]
 
@@ -195,16 +210,14 @@ class Goose:
         i = scores.index(p)
 
         self.cs.append(Cell(x, i, 0.0))
-        
-        self.act = STOCK_ACT[i]
 
-        return self.act.name
+        return STOCK_ACT[i].name
 
 def run_game(gen):
     global tcritic, tgen
     
     if tcritic == None or tgen != gen:
-        tcritic = Critic([32, 32, 48, 48, 48, 48, 64, 64], NUM_ACT, STOCK_X)
+        tcritic = Critic([512, 128, 128, 32], NUM_ACT, STOCK_X)
         tcritic(tcritic.stock)
 
         if gen >= 0:
@@ -227,7 +240,7 @@ def run_game(gen):
                 geese[ii].cs[i - 1].r += 1
 
                 if goose[0] in steps[i - 1][0]['observation']['food']:
-                    geese[ii].cs[i - 1].r += 1
+                    geese[ii].cs[i - 1].r += 0.5
     
     mx = 0
 
@@ -262,8 +275,8 @@ def act_to_id(act):
     elif act.name == 'WEST':
         return 3
 
-def obs_to_x(obs, act):
-    x = [[[0 for _ in range(4)] for _ in range(NUM_GRID[1])] for _ in range(NUM_GRID[0])]
+def obs_to_x(obs, acts):
+    x = [[[0 for _ in range(NUM_CHANNEL)] for _ in range(NUM_GRID[1])] for _ in range(NUM_GRID[0])]
     index = obs['index']
     foods = obs['food']
     geese = obs['geese']
@@ -278,45 +291,43 @@ def obs_to_x(obs, act):
         r = (r + rc) % NUM_GRID[0]
         c = (c + cc) % NUM_GRID[1]
 
-        x[r][c][0] = 1.
+        x[r][c][5] = 1
 
     for i, goose in enumerate(geese):
         if goose:
-            if i != index:
-                r, c = pos_to_coord(goose[0])
-
-                r = (r + rc) % NUM_GRID[0]
-                c = (c + cc) % NUM_GRID[1]
-
-                for tact in STOCK_ACT:
-                    rt, ct = tact.to_row_col()
-
-                    x[(r + rt) % NUM_GRID[0]][(c + ct) % NUM_GRID[1]][2] = 1.
+            r, c = pos_to_coord(goose[0])
             
-            for block in goose:
-                r, c = pos_to_coord(block)
-
-                r = (r + rc) % NUM_GRID[0]
-                c = (c + cc) % NUM_GRID[1]
-
-                x[r][c][1] = 1
-
-            r, c = pos_to_coord(goose[-1])
-
             r = (r + rc) % NUM_GRID[0]
             c = (c + cc) % NUM_GRID[1]
-
-            x[r][c][3] = 1
             
-    if act:
-        r, c = pos_to_coord(geese[index][0])
-        rt, ct = act.opposite().to_row_col()
-        
-        r = (r + rt + rc) % NUM_GRID[0]
-        c = (c + ct + cc) % NUM_GRID[1]
-        
-        x[r][c][1] = 1
-        x[r][c][3] = 0
+            x[r][c][4] = 1
+            
+            if acts[i] != None:
+                x[r][c][act_to_id(acts[i])] = -1
+            
+            for ii, block in enumerate(goose):
+                if ii == 0:
+                    continue
+                
+                r, c = pos_to_coord(block)
+                rt, ct = pos_to_coord(goose[ii - 1])
+                
+                d = None
+                
+                if (r - 1) % NUM_GRID[0] == rt:
+                    d = 0
+                elif (c + 1) % NUM_GRID[1] == ct:
+                    d = 1
+                elif (r + 1) % NUM_GRID[0] == rt:
+                    d = 2
+                elif (c - 1) % NUM_GRID[1] == ct:
+                    d = 3
+                
+                r = (r + rc) % NUM_GRID[0]
+                c = (c + cc) % NUM_GRID[1]
+
+                x[r][c][4] = 1
+                x[r][c][d] = 1
     
     return tf.convert_to_tensor(x, dtype='float32')
 
@@ -329,7 +340,7 @@ class ProgCallback(tf.keras.callbacks.Callback):
         self.pbar.update()
 
 class MyDataset:
-    def __init__(self, xs, ys, acts, shapes, batch_size=2048):
+    def __init__(self, xs, ys, acts, shapes, batch_size=4096):
         self.xs = xs
         self.ys = ys
         self.acts = acts
@@ -340,30 +351,19 @@ class MyDataset:
         indexs = np.arange(len(self.ys))
         np.random.shuffle(indexs)
     
-        for x in range(len(self.ys) // self.batch_size):
-            X = np.empty((self.batch_size, *self.shapes[0]))
-            y = np.empty((self.batch_size, *self.shapes[1]))
-            a = np.empty((self.batch_size, *self.shapes[2]))
+        for x in range(len(self.ys) // self.batch_size + 1):
+            index = indexs[x * self.batch_size:(x + 1) * self.batch_size]
+            
+            X = np.empty((len(index), *self.shapes[0]))
+            y = np.empty((len(index), *self.shapes[1]))
+            a = np.empty((len(index), *self.shapes[2]))
     
-            for i, ii in enumerate(indexs[np.arange(x * self.batch_size, (x + 1) * self.batch_size)]):
+            for i, ii in enumerate(index):
                 X[i,] = self.xs[ii]
                 y[i,] = self.ys[ii]
                 a[i,] = self.acts[ii]
     
             yield X, y, a
-
-        x = len(self.ys) % self.batch_size
-
-        X = np.empty((x, *self.shapes[0]))
-        y = np.empty((x, *self.shapes[1]))
-        a = np.empty((x, *self.shapes[2]))
-
-        for i, ii in enumerate(indexs[np.arange(len(self.ys) - x, len(self.ys))]):
-            X[i,] = self.xs[ii]
-            y[i,] = self.ys[ii]
-            a[i,] = self.acts[ii]
-
-        yield X, y, a
 
     def new(self):
         return tf.data.Dataset.from_generator(
@@ -377,14 +377,11 @@ if __name__ == '__main__':
     
     pool = Pool()
     
-    critic = Critic([32, 32, 48, 48, 48, 48, 64, 64], NUM_ACT, STOCK_X)
+    critic = Critic([512, 128, 128, 32], NUM_ACT, STOCK_X)
     critic(critic.stock)
-    
-    target = critic.clone(critic)
     
     if GEN_ENDED_AT >= 0:
         critic.load_weights(f'ddrive/{GEN_ENDED_AT}c.h5')
-        target.load_weights(f'ddrive/{GEN_ENDED_AT}t.h5')
     
     cg = list()
 
@@ -409,7 +406,7 @@ if __name__ == '__main__':
             ts = pool.map(Cell.deser, ts)
             cg.append(ts)
 
-    for gen in range(GEN_ENDED_AT + 1, 100):
+    for gen in range(GEN_ENDED_AT + 1, GEN_ENDS_AT + 1):
         print(f'Generation {gen}')
         print('Running Games...')
         
@@ -442,7 +439,6 @@ if __name__ == '__main__':
 
         with tqdm.tqdm(total=len(cg)) as pbar:
             for cs in cg:
-                #tcg = CellGroup(cs, target)
                 tcg = CellGroup(cs, critic)
                 
                 xs.extend(tcg.xs)
@@ -454,28 +450,14 @@ if __name__ == '__main__':
         with tqdm.tqdm(total=10) as pbar:
             prog_callback = ProgCallback(pbar)
 
-            cdat = MyDataset(xs, ys, acts, [(*NUM_GRID, 4), (1,), (1,)]).new()
-            cdat = cdat.prefetch(2)
+            cdat = MyDataset(xs, ys, acts, [(*NUM_GRID, NUM_CHANNEL), (1,), (1,)]).new()
+            cdat = cdat.prefetch(tf.data.experimental.AUTOTUNE)
 
-            critic.compile(optimizer=tf.keras.optimizers.SGD(0.02), loss='huber')
+            critic.compile(optimizer=tf.keras.optimizers.SGD(0.1), loss='huber')
             hist = critic.fit(cdat, epochs=10, verbose=0, callbacks=[prog_callback])
 
         print(hist.history['loss'])
 
-        for i in range(len(critic.tower)):
-            w0 = target.tower[i].get_weights()
-            w1 = critic.tower[i].get_weights()
-            target.tower[i].set_weights([w0[ii] * NUM_P + (1 - NUM_P) * w1[ii] for ii in range(len(w0))])
-
-        w0 = target.out.get_weights()
-        w1 = critic.out.get_weights()
-        target.out.set_weights([w0[ii] * NUM_P + (1 - NUM_P) * w1[ii] for ii in range(len(w0))])
-
-        w0 = target.act.get_weights()
-        w1 = critic.act.get_weights()
-        target.act.set_weights([w0[ii] * NUM_P + (1 - NUM_P) * w1[ii] for ii in range(len(w0))])
-
         print("Training Complete.")
 
         critic.save_weights(f'ddrive/{gen}c.h5')
-        target.save_weights(f'ddrive/{gen}t.h5')

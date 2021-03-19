@@ -16,12 +16,10 @@ import tqdm
 import orjson
 import base64
 import socket
+import gc
 from ray.util.multiprocessing import Pool
 from kaggle_environments.envs.hungry_geese.hungry_geese import Action
 from kaggle_environments import make
-
-tcritic = None
-tgen = None
 
 NUM_GRID = (7, 11)
 NUM_CHANNEL = 6
@@ -34,6 +32,9 @@ GAME_PER_GEN = 400
 
 NUM_LAMBDA = 0.8
 NUM_P = 0.95
+
+REW_TURN = 1.
+REW_EAT = 1/3
 
 STOCK_X = tf.convert_to_tensor(np.zeros((*NUM_GRID, NUM_CHANNEL)), dtype='float32')
 STOCK_ACT = [Action(i + 1) for i in range(NUM_ACT)]
@@ -199,7 +200,7 @@ class Goose:
             
         x = obs_to_x(obs, acts)
 
-        scores = [float(score) + 0.1 for score in tf.nn.relu(self.critic(x))[0]]
+        scores = [float(score) + 0.01 for score in tf.nn.relu(self.critic(x))[0]]
 
         sm = 1.5 * sum(scores)
 
@@ -214,18 +215,16 @@ class Goose:
         return STOCK_ACT[i].name
 
 def run_game(gen):
-    global tcritic, tgen
+    tf.keras.backend.clear_session()
+    gc.collect()
     
-    if tcritic == None or tgen != gen:
-        tcritic = Critic([512, 128, 128, 32], NUM_ACT, STOCK_X)
-        tcritic(tcritic.stock)
-
-        if gen >= 0:
-            tcritic.load_weights(f'ddrive/{gen}c.h5')
-            
-        tgen = gen
+    critic = Critic([512, 128, 128, 32], NUM_ACT, STOCK_X)
+    critic(critic.stock)
+    
+    if gen >= 0:
+        critic.load_weights(f'ddrive/{gen}c.h5')
         
-    geese = [Goose(tcritic) for _ in range(NUM_GEESE)]
+    geese = [Goose(critic) for _ in range(NUM_GEESE)]
     env = make('hungry_geese')
     steps = env.run(geese)
 
@@ -237,10 +236,10 @@ def run_game(gen):
 
         for ii, goose in enumerate(obs['geese']):
             if goose:
-                geese[ii].cs[i - 1].r += 1
+                geese[ii].cs[i - 1].r += REW_TURN
 
                 if goose[0] in steps[i - 1][0]['observation']['food']:
-                    geese[ii].cs[i - 1].r += 0.5
+                    geese[ii].cs[i - 1].r += REW_EAT
     
     mx = 0
 
@@ -382,6 +381,8 @@ if __name__ == '__main__':
     
     if GEN_ENDED_AT >= 0:
         critic.load_weights(f'ddrive/{GEN_ENDED_AT}c.h5')
+        
+    critic.compile(optimizer=tf.keras.optimizers.SGD(0.1), loss='huber')
     
     cg = list()
 
@@ -407,6 +408,9 @@ if __name__ == '__main__':
             cg.append(ts)
 
     for gen in range(GEN_ENDED_AT + 1, GEN_ENDS_AT + 1):
+        tf.keras.backend.clear_session()
+        gc.collect()
+        
         print(f'Generation {gen}')
         print('Running Games...')
         
@@ -453,7 +457,6 @@ if __name__ == '__main__':
             cdat = MyDataset(xs, ys, acts, [(*NUM_GRID, NUM_CHANNEL), (1,), (1,)]).new()
             cdat = cdat.prefetch(tf.data.experimental.AUTOTUNE)
 
-            critic.compile(optimizer=tf.keras.optimizers.SGD(0.1), loss='huber')
             hist = critic.fit(cdat, epochs=10, verbose=0, callbacks=[prog_callback])
 
         print(hist.history['loss'])

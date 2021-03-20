@@ -3,11 +3,6 @@ import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-if __name__ == '__main__':
-    os.environ['CUDA_VISIBLE_DEVICES'] = "0"
-else:
-    os.environ['CUDA_VISIBLE_DEVICES'] = "-1"
-
 import tensorflow as tf
 import numpy as np
 import random
@@ -16,10 +11,14 @@ import tqdm
 import orjson
 import base64
 import socket
-import gc
-from ray.util.multiprocessing import Pool
+import resource
+import dill
+from pathos.multiprocessing import ProcessPool
+from pathos.helpers import mp
 from kaggle_environments.envs.hungry_geese.hungry_geese import Action
 from kaggle_environments import make
+
+os.environ['CUDA_VISIBLE_DEVICES'] = "-1"
 
 NUM_GRID = (7, 11)
 NUM_CHANNEL = 6
@@ -30,7 +29,7 @@ GEN_ENDED_AT = int(input())
 GEN_ENDS_AT = int(input())
 GAME_PER_GEN = 400
 
-NUM_LAMBDA = 0.8
+NUM_LAMBDA = 0.9
 NUM_P = 0.95
 
 REW_TURN = 1.
@@ -214,15 +213,8 @@ class Goose:
 
         return STOCK_ACT[i].name
 
-def run_game(gen):
-    tf.keras.backend.clear_session()
-    gc.collect()
-    
-    critic = Critic([512, 128, 128, 32], NUM_ACT, STOCK_X)
-    critic(critic.stock)
-    
-    if gen >= 0:
-        critic.load_weights(f'ddrive/{gen}c.h5')
+def run_game(critics):
+    critic = dill.loads(critics)
         
     geese = [Goose(critic) for _ in range(NUM_GEESE)]
     env = make('hungry_geese')
@@ -371,10 +363,8 @@ class MyDataset:
             output_shapes=((None, *self.shapes[0]), (None, *self.shapes[1]), (None, *self.shapes[2]))
         )
 
-if __name__ == '__main__':
+if __name__ == '__main__':  
     socket.setdefaulttimeout(900)
-    
-    pool = Pool()
     
     critic = Critic([512, 128, 128, 32], NUM_ACT, STOCK_X)
     critic(critic.stock)
@@ -386,81 +376,83 @@ if __name__ == '__main__':
     
     cg = list()
 
-    if GEN_ENDED_AT >= 0:
-        with open(f'ddrive/{GEN_ENDED_AT}c.json') as f:
-            ts = orjson.loads(f.read())
-            ts = pool.map(Cell.deser, ts)
-            cg.append(ts)
-    if GEN_ENDED_AT >= 1:
-        with open(f'ddrive/{GEN_ENDED_AT - 1}c.json') as f:
-            ts = orjson.loads(f.read())
-            ts = pool.map(Cell.deser, ts)
-            cg.append(ts)
-    if GEN_ENDED_AT >= 2:
-        with open(f'ddrive/{GEN_ENDED_AT - 2}c.json') as f:
-            ts = orjson.loads(f.read())
-            ts = pool.map(Cell.deser, ts)
-            cg.append(ts)
-    if GEN_ENDED_AT >= 3:
-        with open(f'ddrive/{GEN_ENDED_AT - 3}c.json') as f:
-            ts = orjson.loads(f.read())
-            ts = pool.map(Cell.deser, ts)
-            cg.append(ts)
+    with ProcessPool(mp.cpu_count()) as pool:
+        if GEN_ENDED_AT >= 0:
+            with open(f'ddrive/{GEN_ENDED_AT}c.json') as f:
+                ts = json.loads(f.read())
+                ts = pool.map(Cell.deser, ts)
+                cg.append(ts)
+        if GEN_ENDED_AT >= 1:
+            with open(f'ddrive/{GEN_ENDED_AT - 1}c.json') as f:
+                ts = json.loads(f.read())
+                ts = pool.map(Cell.deser, ts)
+                cg.append(ts)
+        if GEN_ENDED_AT >= 2:
+            with open(f'ddrive/{GEN_ENDED_AT - 2}c.json') as f:
+                ts = json.loads(f.read())
+                ts = pool.map(Cell.deser, ts)
+                cg.append(ts)
+        if GEN_ENDED_AT >= 3:
+            with open(f'ddrive/{GEN_ENDED_AT - 3}c.json') as f:
+                ts = json.loads(f.read())
+                ts = pool.map(Cell.deser, ts)
+                cg.append(ts)
 
     for gen in range(GEN_ENDED_AT + 1, GEN_ENDS_AT + 1):
-        tf.keras.backend.clear_session()
-        gc.collect()
-        
-        print(f'Generation {gen}')
-        print('Running Games...')
-        
-        cs = list()
+        with ProcessPool(mp.cpu_count()) as pool:
+            print(f'Generation {gen}')
+            print('Running Games...')
 
-        with tqdm.tqdm(total=GAME_PER_GEN) as pbar:
-            for i, dat in enumerate(pool.imap(run_game, [gen - 1] * GAME_PER_GEN)):
-                cs.extend(dat)
-                pbar.update()
+            tcritic = critic.clone(critic)
+            critics = dill.dumps(tcritic)
 
-        print('Running Games Complete.')
-        print('Processing Data...')
+            cs = list()
 
-        cg.insert(0, cs)
-        
-        if len(cg) > 5:
-            cg.pop()
+            with tqdm.tqdm(total=GAME_PER_GEN) as pbar:
+                for i, dat in enumerate(pool.imap(run_game, itertools.repeat(critics, GAME_PER_GEN))):
+                    cs.extend(dat)
+                    pbar.update()
 
-        ts = pool.map(Cell.ser, cs)
-        
-        with open(f'ddrive/{gen}c.json', 'wb') as f:
-            f.write(orjson.dumps(ts))
+            print('Running Games Complete.')
+            print('Processing Data...')
 
-        print('Processing Data Complete.')
-        print("Training...")
-        
-        xs = list()
-        ys = list()
-        acts = list()
+            cg.insert(0, cs)
 
-        with tqdm.tqdm(total=len(cg)) as pbar:
-            for cs in cg:
-                tcg = CellGroup(cs, critic)
-                
-                xs.extend(tcg.xs)
-                ys.extend(tcg.ys)
-                acts.extend(tcg.acts)
-                
-                pbar.update()
+            if len(cg) > 5:
+                cg.pop()
 
-        with tqdm.tqdm(total=10) as pbar:
-            prog_callback = ProgCallback(pbar)
+            ts = pool.map(Cell.ser, cs)
 
-            cdat = MyDataset(xs, ys, acts, [(*NUM_GRID, NUM_CHANNEL), (1,), (1,)]).new()
-            cdat = cdat.prefetch(tf.data.experimental.AUTOTUNE)
+            with open(f'ddrive/{gen}c.json', 'w') as f:
+                f.write(json.dumps(ts))
 
-            hist = critic.fit(cdat, epochs=10, verbose=0, callbacks=[prog_callback])
+            print('Processing Data Complete.')
+            print("Training...")
 
-        print(hist.history['loss'])
+            xs = list()
+            ys = list()
+            acts = list()
 
-        print("Training Complete.")
+            with tqdm.tqdm(total=len(cg)) as pbar:
+                for cs in cg:
+                    tcg = CellGroup(cs, critic)
 
-        critic.save_weights(f'ddrive/{gen}c.h5')
+                    xs.extend(tcg.xs)
+                    ys.extend(tcg.ys)
+                    acts.extend(tcg.acts)
+
+                    pbar.update()
+
+            with tqdm.tqdm(total=10) as pbar:
+                prog_callback = ProgCallback(pbar)
+
+                cdat = MyDataset(xs, ys, acts, [(*NUM_GRID, NUM_CHANNEL), (1,), (1,)]).new()
+                cdat = cdat.prefetch(tf.data.experimental.AUTOTUNE)
+
+                hist = critic.fit(cdat, epochs=10, verbose=0, callbacks=[prog_callback])
+
+            print(hist.history['loss'])
+
+            print("Training Complete.")
+
+            critic.save_weights(f'ddrive/{gen}c.h5')

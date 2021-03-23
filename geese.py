@@ -32,7 +32,7 @@ GAME_PER_GEN = 300
 NUM_REPLAY_BUF = 6
 
 NUM_LAMBDA = 0.8
-NUM_RAND = 5
+NUM_RAND = 2
 
 STOCK_X = tf.convert_to_tensor(np.zeros((*NUM_GRID, NUM_CHANNEL)), dtype='float32')
 STOCK_ACT = [Action(i + 1) for i in range(NUM_ACT)]

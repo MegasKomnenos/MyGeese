@@ -32,6 +32,7 @@ GAME_PER_GEN = 300
 NUM_REPLAY_BUF = 6
 
 NUM_LAMBDA = 0.8
+NUM_RAND = 5
 
 STOCK_X = tf.convert_to_tensor(np.zeros((*NUM_GRID, NUM_CHANNEL)), dtype='float32')
 STOCK_ACT = [Action(i + 1) for i in range(NUM_ACT)]
@@ -261,7 +262,7 @@ class Goose:
             
         x = obs_to_x(obs, acts)
 
-        scores = [float(score) for score in tf.nn.softmax(self.critic(x))[0]]
+        scores = [float(score) for score in tf.nn.softmax(self.critic(x) / NUM_RAND)[0]]
 
         p = random.choices(population=scores, weights=scores)[0]
         i = scores.index(p)

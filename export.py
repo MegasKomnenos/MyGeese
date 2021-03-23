@@ -37,7 +37,6 @@ class Net(tf.keras.Model):
         
         self.flt = tf.keras.layers.Flatten()
         self.out = tf.keras.layers.Dense(out)
-        self.act = tf.keras.layers.PReLU()
     
     def call(self, inp, training=False):
         x = inp
@@ -51,7 +50,6 @@ class Net(tf.keras.Model):
             x = block(x, training=training)
             
         x = self.out(x)
-        x = self.act(x)
             
         return x
         
@@ -59,9 +57,11 @@ gen = int(input())
 
 x = tf.zeros((7, 11, 6))
 
-net = Net([512, 128, 128, 32], NUM_ACT, x)
+net = Net([512, 128, 128, 256], NUM_ACT, x)
 net(net.stock)
-net.load_weights(f'ddrive/{gen}c.h5')
+
+if gen >= 0:
+    net.load_weights(f'ddrive/{gen}c.h5')
 
 with open('ww.txt', 'w') as f:
     f.write(json.dumps([base64.b64encode(arr.astype(np.half)).decode('ascii') for arr in net.get_weights()]))

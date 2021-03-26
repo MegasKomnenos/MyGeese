@@ -11,8 +11,9 @@ import numpy as np
 import random
 import itertools
 import tqdm
-import json
+import dill
 import base64
+import bz2
 from multiprocessing import shared_memory, resource_tracker
 from pathos.multiprocessing import ProcessPool
 from pathos.helpers import mp
@@ -28,7 +29,8 @@ GAME_PER_GEN = 400
 NUM_REPLAY_BUF = 5
 
 NUM_LAMBDA = 0.9
-NUM_RAND = 2
+NUM_RAND = 0.4
+NUM_SCALE = 0.1
 
 STOCK_X = tf.convert_to_tensor(np.zeros((*NUM_GRID, NUM_CHANNEL)), dtype='int8')
 STOCK_ACT = [Action(i + 1) for i in range(NUM_ACT)]
@@ -230,19 +232,10 @@ class Goose:
 
         return STOCK_ACT[i].name
 
-def run_game(gen):
-    critic = Critic([256, 256, 256, 256], NUM_ACT, STOCK_X)
+def run_game(weights):
+    critic = Critic([256, 256, 256, 512], NUM_ACT, STOCK_X)
     critic(critic.stock)
-
-    if gen >= 1:
-        with open(f'ddrive/{gen - 1}w.txt') as f:
-            weights = json.load(f)
-        with open(f'ddrive/{gen - 1}s.txt') as f:
-            shapes = json.load(f)
-        
-        weights = [np.frombuffer(base64.b64decode(s.encode('ascii')), dtype=(np.float16 if shapes[i][1] else np.float32)).reshape(shapes[i][0]) for i, s in enumerate(weights)]
-
-        critic.set_weights(weights)
+    critic.set_weights(dill.loads(weights))
         
     geese = [Goose(critic) for _ in range(NUM_GEESE)]
     env = make('hungry_geese')
@@ -256,9 +249,9 @@ def run_game(gen):
 
         for ii, goose in enumerate(obs['geese']):
             if goose:
-                geese[ii].cs[i - 1].r += len(goose) - 1
+                geese[ii].cs[i - 1].r += (len(goose) - 1) * NUM_SCALE
             elif steps[i - 1][0]['observation']['geese'][ii]:
-                geese[ii].cs[i - 1].r -= 25 + 25 * len(steps[i - 1][0]['observation']['geese'][ii])
+                geese[ii].cs[i - 1].r -= (75 + 25 * len(steps[i - 1][0]['observation']['geese'][ii])) * NUM_SCALE
 
     dat = list()
 
@@ -432,20 +425,16 @@ if __name__ == '__main__':
 
     pool = ProcessPool(mp.cpu_count())
 
-    critic = Critic([256, 256, 256, 256], NUM_ACT, STOCK_X)
+    critic = Critic([256, 256, 256, 512], NUM_ACT, STOCK_X)
     critic(critic.stock)
 
     if GEN_ENDED_AT >= 0:
-        with open(f'ddrive/{GEN_ENDED_AT}w.txt') as f:
-            weights = json.load(f)
-        with open(f'ddrive/{GEN_ENDED_AT}s.txt') as f:
-            shapes = json.load(f)
-        
-        weights = [np.frombuffer(base64.b64decode(s.encode('ascii')), dtype=(np.float16 if shapes[i][1] else np.float32)).reshape(shapes[i][0]) for i, s in enumerate(weights)]
+        with open(f'ddrive/{GEN_ENDED_AT}.txt') as f:
+            weights = dill.loads(bz2.decompress(base64.b64decode(f.read())))
 
         critic.set_weights(weights)
 
-    critic.compile(optimizer=tf.keras.optimizers.SGD(0.1), loss='huber')
+    critic.compile(optimizer=tf.keras.optimizers.SGD(0.1), loss=tf.keras.losses.Huber(10))
 
     cg = CellGroup()
     
@@ -454,10 +443,12 @@ if __name__ == '__main__':
         
         print('Running Games...')
 
+        weights = dill.dumps(critic.get_weights())
+
         cs = list()
 
         with tqdm.tqdm(total=GAME_PER_GEN) as pbar:
-            for i, dat in enumerate(pool.imap(run_game, itertools.repeat(gen, GAME_PER_GEN))):
+            for i, dat in enumerate(pool.imap(run_game, itertools.repeat(weights, GAME_PER_GEN))):
                 cs.extend(dat)
                 pbar.update()
 
@@ -486,10 +477,8 @@ if __name__ == '__main__':
 
         print("Training Complete.")
 
-        with open(f'ddrive/{gen}w.txt', 'w') as f:
-            f.write(json.dumps([base64.b64encode(arr.tobytes()).decode('ascii') for arr in critic.get_weights()]))
-        with open(f'ddrive/{gen}s.txt', 'w') as f:
-            f.write(json.dumps([[arr.shape, arr.dtype == np.float16] for arr in critic.get_weights()]))
+        with open(f'ddrive/{gen}.txt', 'wb') as f:
+            f.write(base64.b64encode(bz2.compress(dill.dumps(critic.get_weights()))))
 
         pool.close()
         pool.join()

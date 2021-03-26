@@ -1,1 +1,0 @@
-[[[539, 256], true], [[256], false], [[256], false], [[256, 256], true], [[256], false], [[256], false], [[256, 256], true], [[256], false], [[256], false], [[256, 256], true], [[256], false], [[256], false], [[256], false], [[256], false], [[256], false], [[256], false], [[256], false], [[256], false], [[256], false], [[256], false], [[256, 4], true], [[4], true]]

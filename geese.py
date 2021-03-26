@@ -11,9 +11,8 @@ import numpy as np
 import random
 import itertools
 import tqdm
-import dill
-import base64
-import bz2
+import pickle
+import lzma
 from multiprocessing import shared_memory, resource_tracker
 from pathos.multiprocessing import ProcessPool
 from pathos.helpers import mp
@@ -233,9 +232,9 @@ class Goose:
         return STOCK_ACT[i].name
 
 def run_game(weights):
-    critic = Critic([256, 256, 256, 512], NUM_ACT, STOCK_X)
+    critic = Critic([512, 256, 256, 128], NUM_ACT, STOCK_X)
     critic(critic.stock)
-    critic.set_weights(dill.loads(weights))
+    critic.set_weights(pickle.loads(weights))
         
     geese = [Goose(critic) for _ in range(NUM_GEESE)]
     env = make('hungry_geese')
@@ -425,12 +424,12 @@ if __name__ == '__main__':
 
     pool = ProcessPool(mp.cpu_count())
 
-    critic = Critic([256, 256, 256, 512], NUM_ACT, STOCK_X)
+    critic = Critic([512, 256, 256, 128], NUM_ACT, STOCK_X)
     critic(critic.stock)
 
     if GEN_ENDED_AT >= 0:
-        with open(f'ddrive/{GEN_ENDED_AT}.txt') as f:
-            weights = dill.loads(bz2.decompress(base64.b64decode(f.read())))
+        with open(f'ddrive/{GEN_ENDED_AT}.txt', 'rb') as f:
+            weights = pickle.loads(lzma.decompress(f.read()))
 
         critic.set_weights(weights)
 
@@ -443,7 +442,7 @@ if __name__ == '__main__':
         
         print('Running Games...')
 
-        weights = dill.dumps(critic.get_weights())
+        weights = pickle.dumps(critic.get_weights())
 
         cs = list()
 
@@ -478,7 +477,7 @@ if __name__ == '__main__':
         print("Training Complete.")
 
         with open(f'ddrive/{gen}.txt', 'wb') as f:
-            f.write(base64.b64encode(bz2.compress(dill.dumps(critic.get_weights()))))
+            f.write(lzma.compress(pickle.dumps(critic.get_weights()), preset=9))
 
         pool.close()
         pool.join()

@@ -3,7 +3,7 @@ import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-if __name__ == '__main__':
+if __name__ != '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = "-1"
 
 import tensorflow as tf
@@ -13,35 +13,31 @@ import itertools
 import tqdm
 import json
 import base64
-import dill
-import time
-import math
 from multiprocessing import shared_memory, resource_tracker
 from pathos.multiprocessing import ProcessPool
 from pathos.helpers import mp
 from kaggle_environments.envs.hungry_geese.hungry_geese import Action
 from kaggle_environments import make
-from pathfinding.core.grid import Grid
 
 NUM_GRID = (7, 11)
-NUM_CHANNEL = 6
+NUM_CHANNEL = 7
 NUM_ACT = 4
 NUM_GEESE = 4
     
-GAME_PER_GEN = 300
-NUM_REPLAY_BUF = 6
+GAME_PER_GEN = 400
+NUM_REPLAY_BUF = 5
 
-NUM_LAMBDA = 0.8
+NUM_LAMBDA = 0.9
 NUM_RAND = 2
 
-STOCK_X = tf.convert_to_tensor(np.zeros((*NUM_GRID, NUM_CHANNEL)), dtype='float32')
+STOCK_X = tf.convert_to_tensor(np.zeros((*NUM_GRID, NUM_CHANNEL)), dtype='int8')
 STOCK_ACT = [Action(i + 1) for i in range(NUM_ACT)]
 
 class Block(tf.keras.layers.Layer):
     def __init__(self, flt, **kwargs):
         super(Block, self).__init__(**kwargs)
         
-        self.dense = tf.keras.layers.Dense(flt, use_bias=False)
+        self.dense = tf.keras.layers.Dense(flt, use_bias=False, dtype='float16')
         self.bn = tf.keras.layers.BatchNormalization()
         
     def call(self, inp, training=False):
@@ -64,7 +60,7 @@ class Net(tf.keras.Model):
             self.tower.append(Block(l))
         
         self.flt = tf.keras.layers.Flatten()
-        self.out = tf.keras.layers.Dense(out)
+        self.out = tf.keras.layers.Dense(out, dtype='float16')
     
     def call(self, inp, training=False):
         x = inp
@@ -95,10 +91,16 @@ class Net(tf.keras.Model):
 
 class Critic(Net):
     def train_step(self, dat):
-        x, y, act = dat
+        x, xx, ss, r, a = dat
+
+        y = self(xx, training=True)
+        y = tf.reduce_max(y, axis=1, keepdims=True)
+        y = tf.where(ss, y, tf.zeros_like(y))
+        y *= NUM_LAMBDA
+        y += r
 
         with tf.GradientTape() as tape:
-            y_pred = tf.gather(self(x, training=True), act, batch_dims=1)
+            y_pred = tf.gather(self(x, training=True), a, batch_dims=1)
             loss = self.compiled_loss(y, y_pred, regularization_losses=self.losses)
         
         t = self.trainable_variables
@@ -112,44 +114,23 @@ class Critic(Net):
 class Cell:
     def __init__(self, s, a, r):
         self.s = s
-        self.ss = None
+        self.ss = False
         self.a = a
         self.r = r
-    
-    def ser(self):
-        out = dict()
-
-        out['s'] = base64.b64encode(self.s.numpy()).decode('ascii')
-        out['a'] = self.a
-        out['r'] = self.r
-
-        if self.ss != None:
-            out['ss'] = base64.b64encode(self.ss.numpy()).decode('ascii')
-
-        return out
-
-    def deser(dct):
-        dct['s'] = tf.convert_to_tensor(np.frombuffer(base64.decodebytes(dct['s'].encode('utf-8')), dtype=np.float32).reshape((*NUM_GRID, NUM_CHANNEL)))
-        out = Cell(dct['s'], dct['a'], dct['r'])
-
-        if 'ss' in dct:
-            out.ss = tf.convert_to_tensor(np.frombuffer(base64.decodebytes(dct['ss'].encode('utf-8')), dtype=np.float32).reshape((*NUM_GRID, NUM_CHANNEL)))
-        
-        return out
 
 class CellGroup:
     def __init__(self, create=True, cs=None):
-        self.s_sm = shared_memory.SharedMemory(create=create, name='s_sm', size=2217600000)
-        self.s = np.ndarray((1200000, *NUM_GRID, NUM_CHANNEL), dtype=np.float32, buffer=self.s_sm.buf)
+        self.s_sm = shared_memory.SharedMemory(create=create, name='s_sm', size=(2400000 * NUM_GRID[0] * NUM_GRID[1] * NUM_CHANNEL))
+        self.s = np.ndarray((2400000, *NUM_GRID, NUM_CHANNEL), dtype=np.int8, buffer=self.s_sm.buf)
 
-        self.ss_sm = shared_memory.SharedMemory(create=create, name='ss_sm', size=1200000)
-        self.ss = np.ndarray((1200000, 1), dtype=np.bool, buffer=self.ss_sm.buf)
+        self.ss_sm = shared_memory.SharedMemory(create=create, name='ss_sm', size=2400000)
+        self.ss = np.ndarray((2400000, 1), dtype=bool, buffer=self.ss_sm.buf)
 
         self.r_sm = shared_memory.SharedMemory(create=create, name='r_sm', size=4800000)
-        self.r = np.ndarray((1200000, 1), dtype=np.float32, buffer=self.r_sm.buf)
+        self.r = np.ndarray((2400000, 1), dtype=np.float16, buffer=self.r_sm.buf)
 
-        self.a_sm = shared_memory.SharedMemory(create=create, name='a_sm', size=4800000)
-        self.a = np.ndarray((1200000, 1), dtype=np.int32, buffer=self.a_sm.buf)
+        self.a_sm = shared_memory.SharedMemory(create=create, name='a_sm', size=9600000)
+        self.a = np.ndarray((2400000, 1), dtype=np.int32, buffer=self.a_sm.buf)
 
         if create:
             self.cs = list()
@@ -165,13 +146,9 @@ class CellGroup:
             p += 1
 
             self.s[p] = cell.s
+            self.ss[p] = cell.ss
             self.r[p] = cell.r
             self.a[p] = cell.a
-
-            if cell.ss != None:
-                self.ss[p + 1] = True
-            else:
-                self.ss[p + 1] = False
         
         self.cl = p
         self.cs.append(p)
@@ -196,24 +173,6 @@ class CellGroup:
             self.cl = self.cs[-1]
         else:
             self.cl = -1
-    
-    def get_y(self, target):
-        ys = np.copy(self.r[:self.cl + 1])
-        s = self.s[:self.cl + 1]
-        ss = self.ss[:self.cl + 1]
-
-        for b in range((self.cl + 1) // 4096 + 1):
-            ts = s[b * 4096:(b + 1) * 4096]
-            y = target(ts, training=True)
-            y = tf.reduce_max(y, axis=1, keepdims=True)
-            y = np.where(ss[b * 4096:(b + 1) * 4096], y, np.zeros(y.shape))
-            
-            if b == 0:
-                ys[:len(y) - 1] += y[1:]
-            else:
-                ys[b * 4096 - 1:b * 4096 - 1 + len(y)] += y
-
-        return ys
 
     def close(self, full=False):
         self.s_sm.close()
@@ -271,8 +230,19 @@ class Goose:
 
         return STOCK_ACT[i].name
 
-def run_game(critics):
-    critic = dill.loads(critics)
+def run_game(gen):
+    critic = Critic([256, 256, 256, 256], NUM_ACT, STOCK_X)
+    critic(critic.stock)
+
+    if gen >= 1:
+        with open(f'ddrive/{gen - 1}w.txt') as f:
+            weights = json.load(f)
+        with open(f'ddrive/{gen - 1}s.txt') as f:
+            shapes = json.load(f)
+        
+        weights = [np.frombuffer(base64.b64decode(s.encode('ascii')), dtype=(np.float16 if shapes[i][1] else np.float32)).reshape(shapes[i][0]) for i, s in enumerate(weights)]
+
+        critic.set_weights(weights)
         
     geese = [Goose(critic) for _ in range(NUM_GEESE)]
     env = make('hungry_geese')
@@ -283,77 +253,18 @@ def run_game(critics):
             continue
 
         obs = step[0]['observation']
-        matrix = [[1 for _ in range(NUM_GRID[0])] for _ in range(NUM_GRID[1])]
-
-        for goose in obs['geese']:
-            for block in goose:
-                r, c = pos_to_coord(block)
-                
-                matrix[c][r] = 0
-
-        pos = list()
-        mn = 0.
 
         for ii, goose in enumerate(obs['geese']):
             if goose:
-                grid = Grid(matrix=matrix)
-
-                grid.set_passable_left_right_border()
-                grid.set_passable_up_down_border()
-
-                for column in grid.nodes:
-                    for node in column:
-                        node.g = -1
-                
-                lst = [grid.node(*pos_to_coord(goose[0]))]
-                lst[0].g = 0
-                lst[0].opened = 1
-
-                while lst:
-                    lst.sort(reverse=True, key=(lambda x: x.g))
-                    
-                    cur = lst.pop()
-
-                    neighbs = [neighb for neighb in grid.neighbors(cur) if neighb.opened == 0]
-
-                    for neighb in neighbs:
-                        neighb.g = cur.g + 1
-                        neighb.opened = 1
-                        
-                        lst.append(neighb)
-                        
-                sm = 0.
-
-                for column in grid.nodes:
-                    for node in column:
-                        if node.g > 0:
-                            sm += 1 / node.g**2
-                
-                pos.append(sm)
-                mn += sm
-            else:
-                pos.append(None)
-
-        if mn > 0.:
-            mn /= len(pos) - pos.count(None)
-
-            for ii, goose in enumerate(obs['geese']):
-                if goose:
-                    geese[ii].cs[i - 1].r += math.exp(3 * (pos[ii] - mn) / mn)
-                    geese[ii].cs[i - 1].r += math.log(len(goose))
-                elif steps[i - 1][0]['observation']['geese'][ii]:
-                    geese[ii].cs[i - 1].r -= 20.
-            
-        if i + 1 == len(steps):
-            for ii, goose in enumerate(obs['geese']):
-                if goose:
-                    geese[ii].cs[i - 1].r += 20.
+                geese[ii].cs[i - 1].r += len(goose) - 1
+            elif steps[i - 1][0]['observation']['geese'][ii]:
+                geese[ii].cs[i - 1].r -= 25 + 25 * len(steps[i - 1][0]['observation']['geese'][ii])
 
     dat = list()
 
     for goose in geese:
-        for i, c in enumerate(goose.cs[:-1]):
-            c.ss = goose.cs[i + 1].s
+        for c in goose.cs[:-1]:
+            c.ss = True
         
         dat.extend(goose.cs)
     
@@ -388,7 +299,7 @@ def obs_to_x(obs, acts):
         r = (r + rc) % NUM_GRID[0]
         c = (c + cc) % NUM_GRID[1]
 
-        x[r][c][5] = 1
+        x[r][c][6] = 1
 
     for i, goose in enumerate(geese):
         if goose:
@@ -398,9 +309,10 @@ def obs_to_x(obs, acts):
             c = (c + cc) % NUM_GRID[1]
             
             x[r][c][4] = 1
+            x[r][c][5] = 1
             
             if acts[i] != None:
-                x[r][c][act_to_id(acts[i])] = -1
+                x[r][c][act_to_id(acts[i])] = 1
             
             for ii, block in enumerate(goose):
                 if ii == 0:
@@ -426,7 +338,7 @@ def obs_to_x(obs, acts):
                 x[r][c][4] = 1
                 x[r][c][d] = 1
     
-    return tf.convert_to_tensor(x, dtype='float32')
+    return tf.convert_to_tensor(x, dtype='int8')
 
 class ProgCallback(tf.keras.callbacks.Callback):
     def __init__(self, pbar, **kwargs):
@@ -437,41 +349,56 @@ class ProgCallback(tf.keras.callbacks.Callback):
         self.pbar.update()
 
 class MyDataset:
-    def __init__(self, ys, shapes, batch_size=1024):
-        self.ys = ys
+    def __init__(self, total, pool, shapes, batch_size=2048):
+        self.total = total
+        self.pool = pool
         self.shapes = shapes
         self.batch_size = batch_size
 
     def _generator(self):
-        indexs = np.arange(len(self.ys))
+        indexs = np.arange(self.total)
         np.random.shuffle(indexs)
+
+        stride = (NUM_GRID[0] * NUM_GRID[1] * NUM_CHANNEL * 1, 1, 2, 4)
+
+        s_sm = shared_memory.SharedMemory(name='s_sm')
+        ss_sm = shared_memory.SharedMemory(name='ss_sm')
+        r_sm = shared_memory.SharedMemory(name='r_sm')
+        a_sm = shared_memory.SharedMemory(name='a_sm')
         
         for x in range(len(indexs) // self.batch_size + 1):
             index = indexs[x * self.batch_size:(x + 1) * self.batch_size]
 
             if len(index) > 0:
-                s_sm = shared_memory.SharedMemory(name='s_sm')
-                a_sm = shared_memory.SharedMemory(name='a_sm')
-
-                X = np.empty((len(index), *self.shapes[0]), dtype=np.float32)
-                y = np.empty((len(index), *self.shapes[1]), dtype=np.float32)
-                a = np.empty((len(index), *self.shapes[2]), dtype=np.int32)
+                X = np.empty((len(index), *self.shapes[0]), dtype=np.int8)
+                XX = np.empty((len(index), *self.shapes[0]), dtype=np.int8)
+                ss = np.empty((len(index), *self.shapes[1]), dtype=bool)
+                r = np.empty((len(index), *self.shapes[2]), dtype=np.float16)
+                a = np.empty((len(index), *self.shapes[3]), dtype=np.int32)
 
                 for i, ii in enumerate(index):
-                    X[i,] = np.ndarray(self.shapes[0], dtype=np.float32, buffer=s_sm.buf[NUM_GRID[0] * NUM_GRID[1] * NUM_CHANNEL * 4 * ii:NUM_GRID[0] * NUM_GRID[1] * NUM_CHANNEL * 4 * (ii + 1)])
-                    y[i,] = self.ys[ii]
-                    a[i,] = np.ndarray(self.shapes[2], dtype=np.int32, buffer=a_sm.buf[4 * ii:4 * (ii + 1)])
+                    X[i,] = np.ndarray(self.shapes[0], dtype=np.int8, buffer=s_sm.buf[stride[0] * ii:stride[0] * (ii + 1)])
+                    ss[i,] = np.ndarray(self.shapes[1], dtype=bool, buffer=ss_sm.buf[stride[1] * ii:stride[1] * (ii + 1)])
+                    r[i,] = np.ndarray(self.shapes[2], dtype=np.float16, buffer=r_sm.buf[stride[2] * ii:stride[2] * (ii + 1)])
+                    a[i,] = np.ndarray(self.shapes[3], dtype=np.int32, buffer=a_sm.buf[stride[3] * ii:stride[3] * (ii + 1)])
 
-                s_sm.close()
-                a_sm.close()
+                    if ss[i][0]:
+                        XX[i,] = np.ndarray(self.shapes[0], dtype=np.int8, buffer=s_sm.buf[stride[0] * (ii + 1):stride[0] * (ii + 2)])
+                    else:
+                        XX[i,] = np.zeros(self.shapes[0], dtype=np.int8)
         
-                yield X, y, a
+                yield X, XX, ss, r, a
+
+        s_sm.close()
+        ss_sm.close()
+        r_sm.close()
+        a_sm.close()
 
     def new(self):
         return tf.data.Dataset.from_generator(
             self._generator,
-            output_types=('float32', 'float32', 'int32'), 
-            output_shapes=((None, *self.shapes[0]), (None, *self.shapes[1]), (None, *self.shapes[2]))
+            output_types=('int8', 'int8', 'bool', 'float16', 'int32'), 
+            output_shapes=((None, *self.shapes[0]), (None, *self.shapes[0]), (None, *self.shapes[1]), (None, *self.shapes[2]), (None, *self.shapes[3]))
         )
 
 def remove_shm_from_resource_tracker():
@@ -495,39 +422,9 @@ def remove_shm_from_resource_tracker():
     if "shared_memory" in resource_tracker._CLEANUP_FUNCS:
         del resource_tracker._CLEANUP_FUNCS["shared_memory"]
 
-def fit_proc(gen, cs):
+if __name__ == '__main__':  
     remove_shm_from_resource_tracker()
 
-    critic = Critic([512, 128, 128, 256], NUM_ACT, STOCK_X)
-    critic(critic.stock)
-
-    if gen >= 1:
-        critic.load_weights(f'ddrive/{gen - 1}c.h5')
-
-    cg = CellGroup(create=False, cs=cs)
-
-    dat = MyDataset(cg.get_y(critic), [(*NUM_GRID, NUM_CHANNEL), (1,), (1,)]).new()
-    dat = dat.prefetch(tf.data.experimental.AUTOTUNE)
-
-    critic.compile(optimizer=tf.keras.optimizers.SGD(0.04), loss='huber')
-
-    print('Processing Data Complete.')
-    print("Training...")
-
-    with tqdm.tqdm(total=10) as pbar:
-        prog_callback = ProgCallback(pbar)
-
-        hist = critic.fit(dat, epochs=10, verbose=0, callbacks=[prog_callback])
-
-    print(hist.history['loss'])
-
-    print("Training Complete.")
-
-    critic.save_weights(f'ddrive/{gen}c.h5')
-
-    cg.close()
-
-if __name__ == '__main__':  
     GEN_ENDED_AT = int(input())
     GEN_ENDS_AT = int(input())
 
@@ -535,30 +432,34 @@ if __name__ == '__main__':
 
     pool = ProcessPool(mp.cpu_count())
 
-    critic = Critic([512, 128, 128, 256], NUM_ACT, STOCK_X)
+    critic = Critic([256, 256, 256, 256], NUM_ACT, STOCK_X)
     critic(critic.stock)
 
-    cg = CellGroup()
+    if GEN_ENDED_AT >= 0:
+        with open(f'ddrive/{GEN_ENDED_AT}w.txt') as f:
+            weights = json.load(f)
+        with open(f'ddrive/{GEN_ENDED_AT}s.txt') as f:
+            shapes = json.load(f)
+        
+        weights = [np.frombuffer(base64.b64decode(s.encode('ascii')), dtype=(np.float16 if shapes[i][1] else np.float32)).reshape(shapes[i][0]) for i, s in enumerate(weights)]
 
+        critic.set_weights(weights)
+
+    critic.compile(optimizer=tf.keras.optimizers.SGD(0.1), loss='huber')
+
+    cg = CellGroup()
+    
     for gen in range(GEN_ENDED_AT + 1, GEN_ENDS_AT + 1):
         print(f'Generation {gen}')
         
         print('Running Games...')
 
-        if gen >= 1:
-            critic.load_weights(f'ddrive/{gen - 1}c.h5')
-
-        critics = dill.dumps(critic)
-
         cs = list()
 
         with tqdm.tqdm(total=GAME_PER_GEN) as pbar:
-            for i, dat in enumerate(pool.imap(run_game, itertools.repeat(critics, GAME_PER_GEN))):
+            for i, dat in enumerate(pool.imap(run_game, itertools.repeat(gen, GAME_PER_GEN))):
                 cs.extend(dat)
                 pbar.update()
-        
-        pool.close()
-        pool.join()
 
         print('Running Games Complete.')
         print('Processing Data...')
@@ -568,17 +469,30 @@ if __name__ == '__main__':
         if len(cg.cs) > NUM_REPLAY_BUF:
             cg.pop()
 
-        os.environ['CUDA_VISIBLE_DEVICES'] = "0"
+        total = cg.cl + 1
 
-        tcs = list(cg.cs)
+        dat = MyDataset(total, pool, [(*NUM_GRID, NUM_CHANNEL), (1,), (1,), (1,)]).new()
+        dat = dat.prefetch(tf.data.AUTOTUNE)
 
-        p = mp.Process(target=fit_proc, args=(gen, tcs))
-        p.start()
-        p.join()
-        p.close()
+        print('Processing Data Complete.')
+        print("Training...")
 
-        os.environ['CUDA_VISIBLE_DEVICES'] = "-1"
+        with tqdm.tqdm(total=10) as pbar:
+            prog_callback = ProgCallback(pbar)
 
+            hist = critic.fit(dat, epochs=10, verbose=0, callbacks=[prog_callback])
+
+        print(hist.history['loss'])
+
+        print("Training Complete.")
+
+        with open(f'ddrive/{gen}w.txt', 'w') as f:
+            f.write(json.dumps([base64.b64encode(arr.tobytes()).decode('ascii') for arr in critic.get_weights()]))
+        with open(f'ddrive/{gen}s.txt', 'w') as f:
+            f.write(json.dumps([[arr.shape, arr.dtype == np.float16] for arr in critic.get_weights()]))
+
+        pool.close()
+        pool.join()
         pool.restart()
 
     cg.close(full=True)

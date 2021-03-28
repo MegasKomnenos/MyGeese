@@ -14,7 +14,6 @@ import tqdm
 import pickle
 import lzma
 import base64
-from multiprocessing import shared_memory, resource_tracker
 from pathos.multiprocessing import ProcessPool
 from pathos.helpers import mp
 from kaggle_environments.envs.hungry_geese.hungry_geese import Action
@@ -25,7 +24,7 @@ NUM_CHANNEL = 7
 NUM_ACT = 4
 NUM_GEESE = 4
     
-GAME_PER_GEN = 400
+GAME_PER_GEN = 512
 NUM_REPLAY_BUF = 2
 
 NUM_LAMBDA = 0.95
@@ -138,17 +137,10 @@ class Cell:
 
 class CellGroup:
     def __init__(self, create=True, cs=None):
-        self.s_sm = shared_memory.SharedMemory(create=create, name='s_sm', size=(2400000 * NUM_GRID[0] * NUM_GRID[1] * NUM_CHANNEL))
-        self.s = np.ndarray((2400000, *NUM_GRID, NUM_CHANNEL), dtype=np.int8, buffer=self.s_sm.buf)
-
-        self.ss_sm = shared_memory.SharedMemory(create=create, name='ss_sm', size=2400000)
-        self.ss = np.ndarray((2400000, 1), dtype=bool, buffer=self.ss_sm.buf)
-
-        self.r_sm = shared_memory.SharedMemory(create=create, name='r_sm', size=9600000)
-        self.r = np.ndarray((2400000, 1), dtype=np.float32, buffer=self.r_sm.buf)
-
-        self.a_sm = shared_memory.SharedMemory(create=create, name='a_sm', size=9600000)
-        self.a = np.ndarray((2400000, 1), dtype=np.int32, buffer=self.a_sm.buf)
+        self.s = np.ndarray((819200, *NUM_GRID, NUM_CHANNEL), dtype=np.int8)
+        self.ss = np.ndarray((819200, 1), dtype=bool)
+        self.r = np.ndarray((819200, 1), dtype=np.float32)
+        self.a = np.ndarray((819200, 1), dtype=np.int32)
 
         if create:
             self.cs = list()
@@ -191,18 +183,6 @@ class CellGroup:
             self.cl = self.cs[-1]
         else:
             self.cl = -1
-
-    def close(self, full=False):
-        self.s_sm.close()
-        self.ss_sm.close()
-        self.r_sm.close()
-        self.a_sm.close()
-
-        if full:
-            self.s_sm.unlink()
-            self.ss_sm.unlink()
-            self.r_sm.unlink()
-            self.a_sm.unlink()
 
 class Goose:
     def __init__(self, critic):
@@ -361,22 +341,18 @@ class ProgCallback(tf.keras.callbacks.Callback):
         self.pbar.update()
 
 class MyDataset:
-    def __init__(self, total, pool, shapes, batch_size=512):
+    def __init__(self, s, ss, r, a, total, shapes, batch_size=2048):
+        self.s = s
+        self.ss = ss
+        self.r = r
+        self.a = a
         self.total = total
-        self.pool = pool
         self.shapes = shapes
         self.batch_size = batch_size
 
     def _generator(self):
         indexs = np.arange(self.total)
         np.random.shuffle(indexs)
-
-        stride = (NUM_GRID[0] * NUM_GRID[1] * NUM_CHANNEL * 1, 1, 4, 4)
-
-        s_sm = shared_memory.SharedMemory(name='s_sm')
-        ss_sm = shared_memory.SharedMemory(name='ss_sm')
-        r_sm = shared_memory.SharedMemory(name='r_sm')
-        a_sm = shared_memory.SharedMemory(name='a_sm')
         
         for x in range(len(indexs) // self.batch_size + 1):
             index = indexs[x * self.batch_size:(x + 1) * self.batch_size]
@@ -389,22 +365,17 @@ class MyDataset:
                 a = np.empty((len(index), *self.shapes[3]), dtype=np.int32)
 
                 for i, ii in enumerate(index):
-                    X[i,] = np.ndarray(self.shapes[0], dtype=np.int8, buffer=s_sm.buf[stride[0] * ii:stride[0] * (ii + 1)])
-                    ss[i,] = np.ndarray(self.shapes[1], dtype=bool, buffer=ss_sm.buf[stride[1] * ii:stride[1] * (ii + 1)])
-                    r[i,] = np.ndarray(self.shapes[2], dtype=np.float32, buffer=r_sm.buf[stride[2] * ii:stride[2] * (ii + 1)])
-                    a[i,] = np.ndarray(self.shapes[3], dtype=np.int32, buffer=a_sm.buf[stride[3] * ii:stride[3] * (ii + 1)])
+                    X[i,] = self.s[ii]
+                    ss[i,] = self.ss[ii]
+                    r[i,] = self.r[ii]
+                    a[i,] = self.a[ii]
 
                     if ss[i][0]:
-                        XX[i,] = np.ndarray(self.shapes[0], dtype=np.int8, buffer=s_sm.buf[stride[0] * (ii + 1):stride[0] * (ii + 2)])
+                        XX[i,] = self.s[ii + 1]
                     else:
                         XX[i,] = np.zeros(self.shapes[0], dtype=np.int8)
         
                 yield X, XX, ss, r, a
-
-        s_sm.close()
-        ss_sm.close()
-        r_sm.close()
-        a_sm.close()
 
     def new(self):
         return tf.data.Dataset.from_generator(
@@ -413,30 +384,7 @@ class MyDataset:
             output_shapes=((None, *self.shapes[0]), (None, *self.shapes[0]), (None, *self.shapes[1]), (None, *self.shapes[2]), (None, *self.shapes[3]))
         )
 
-def remove_shm_from_resource_tracker():
-    """Monkey-patch multiprocessing.resource_tracker so SharedMemory won't be tracked
-
-    More details at: https://bugs.python.org/issue38119
-    """
-
-    def fix_register(name, rtype):
-        if rtype == "shared_memory":
-            return
-        return resource_tracker._resource_tracker.register(self, name, rtype)
-    resource_tracker.register = fix_register
-
-    def fix_unregister(name, rtype):
-        if rtype == "shared_memory":
-            return
-        return resource_tracker._resource_tracker.unregister(self, name, rtype)
-    resource_tracker.unregister = fix_unregister
-
-    if "shared_memory" in resource_tracker._CLEANUP_FUNCS:
-        del resource_tracker._CLEANUP_FUNCS["shared_memory"]
-
 if __name__ == '__main__':  
-    remove_shm_from_resource_tracker()
-
     GEN_ENDED_AT = int(input())
     GEN_ENDS_AT = int(input())
 
@@ -453,7 +401,7 @@ if __name__ == '__main__':
 
         critic.set_weights(weights)
 
-    critic.compile(optimizer=tf.keras.optimizers.SGD(0.04), loss='mse')
+    critic.compile(optimizer=tf.keras.optimizers.SGD(0.04), loss=tf.keras.losses.Huber(16))
 
     cg = CellGroup()
     
@@ -481,7 +429,7 @@ if __name__ == '__main__':
 
         total = cg.cl + 1
 
-        dat = MyDataset(total, pool, [(*NUM_GRID, NUM_CHANNEL), (1,), (1,), (1,)]).new()
+        dat = MyDataset(cg.s, cg.ss, cg.r, cg.a, total, [(*NUM_GRID, NUM_CHANNEL), (1,), (1,), (1,)]).new()
 
         print('Processing Data Complete.')
         print("Training...")
@@ -501,5 +449,3 @@ if __name__ == '__main__':
         pool.close()
         pool.join()
         pool.restart()
-
-    cg.close(full=True)

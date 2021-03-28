@@ -2,12 +2,9 @@
 !.gitignore
 !*/
 !ddrive/**
-!export.py
 !geese.py
 !test_run.ipynb
-!ws.txt
-!ww.txt
+!submission.py
 tutorials
 src
 tensorflow-inference-tensorrt5-t4-gpu
-*.json

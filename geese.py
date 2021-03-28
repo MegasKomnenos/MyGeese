@@ -13,6 +13,7 @@ import itertools
 import tqdm
 import pickle
 import lzma
+import base64
 from multiprocessing import shared_memory, resource_tracker
 from pathos.multiprocessing import ProcessPool
 from pathos.helpers import mp
@@ -25,10 +26,10 @@ NUM_ACT = 4
 NUM_GEESE = 4
     
 GAME_PER_GEN = 400
-NUM_REPLAY_BUF = 5
+NUM_REPLAY_BUF = 2
 
-NUM_LAMBDA = 0.9
-NUM_RAND = 0.4
+NUM_LAMBDA = 0.95
+NUM_RAND = 1
 NUM_SCALE = 0.1
 
 STOCK_X = tf.convert_to_tensor(np.zeros((*NUM_GRID, NUM_CHANNEL)), dtype='int8')
@@ -37,13 +38,26 @@ STOCK_ACT = [Action(i + 1) for i in range(NUM_ACT)]
 class Block(tf.keras.layers.Layer):
     def __init__(self, flt, **kwargs):
         super(Block, self).__init__(**kwargs)
-        
-        self.dense = tf.keras.layers.Dense(flt, use_bias=False, dtype='float16')
-        self.bn = tf.keras.layers.BatchNormalization()
+
+        self.conv_0 = tf.keras.layers.Conv2D(flt, 3, use_bias=False)
+        self.conv_1 = tf.keras.layers.Conv2D(flt, 3, use_bias=False)
+        self.conv_2 = tf.keras.layers.Conv2D(flt, 1)
+
+        self.bn_0 = tf.keras.layers.BatchNormalization()
+        self.bn_1 = tf.keras.layers.BatchNormalization()
         
     def call(self, inp, training=False):
-        x = self.dense(inp)
-        x = self.bn(x, training)
+        x = inp
+        x = tf.concat([x[:, -1:, :, :], x, x[:, 0:1, :, :]], axis=1)
+        x = tf.concat([x[:, :, -1:, :], x, x[:, :, 0:1, :]], axis=2)
+        x = self.conv_0(x)
+        x = self.bn_0(x, training)
+        x = tf.nn.relu(x)
+        x = tf.concat([x[:, -1:, :, :], x, x[:, 0:1, :, :]], axis=1)
+        x = tf.concat([x[:, :, -1:, :], x, x[:, :, 0:1, :]], axis=2)
+        x = self.conv_1(x)
+        x = self.bn_1(x, training)
+        x += self.conv_2(inp)
         x = tf.nn.relu(x)
         
         return x
@@ -61,19 +75,20 @@ class Net(tf.keras.Model):
             self.tower.append(Block(l))
         
         self.flt = tf.keras.layers.Flatten()
-        self.out = tf.keras.layers.Dense(out, dtype='float16')
+        self.out = tf.keras.layers.Dense(out, dtype='float32')
     
     def call(self, inp, training=False):
         x = inp
 
         if len(x.shape) < 4:
             x = tf.expand_dims(x, 0)
-            
-        x = self.flt(x)
+
+        x = tf.cast(x, dtype='float32')
 
         for block in self.tower:
             x = block(x, training=training)
-            
+        
+        x = self.flt(x)
         x = self.out(x)
             
         return x
@@ -95,7 +110,9 @@ class Critic(Net):
         x, xx, ss, r, a = dat
 
         y = self(xx, training=True)
-        y = tf.reduce_max(y, axis=1, keepdims=True)
+        yy = tf.math.reduce_min(y, axis=1, keepdims=True) - 1
+        y -= yy
+        y = tf.math.reduce_sum(y * y, axis=1, keepdims=True) / tf.math.reduce_sum(y, axis=1, keepdims=True) + yy
         y = tf.where(ss, y, tf.zeros_like(y))
         y *= NUM_LAMBDA
         y += r
@@ -127,8 +144,8 @@ class CellGroup:
         self.ss_sm = shared_memory.SharedMemory(create=create, name='ss_sm', size=2400000)
         self.ss = np.ndarray((2400000, 1), dtype=bool, buffer=self.ss_sm.buf)
 
-        self.r_sm = shared_memory.SharedMemory(create=create, name='r_sm', size=4800000)
-        self.r = np.ndarray((2400000, 1), dtype=np.float16, buffer=self.r_sm.buf)
+        self.r_sm = shared_memory.SharedMemory(create=create, name='r_sm', size=9600000)
+        self.r = np.ndarray((2400000, 1), dtype=np.float32, buffer=self.r_sm.buf)
 
         self.a_sm = shared_memory.SharedMemory(create=create, name='a_sm', size=9600000)
         self.a = np.ndarray((2400000, 1), dtype=np.int32, buffer=self.a_sm.buf)
@@ -232,7 +249,7 @@ class Goose:
         return STOCK_ACT[i].name
 
 def run_game(weights):
-    critic = Critic([512, 256, 256, 128], NUM_ACT, STOCK_X)
+    critic = Critic([64, 64, 64, 64, 64], NUM_ACT, STOCK_X)
     critic(critic.stock)
     critic.set_weights(pickle.loads(weights))
         
@@ -248,15 +265,18 @@ def run_game(weights):
 
         for ii, goose in enumerate(obs['geese']):
             if goose:
-                geese[ii].cs[i - 1].r += (len(goose) - 1) * NUM_SCALE
+                geese[ii].cs[i - 1].r += (1 + len(goose)) * NUM_SCALE
             elif steps[i - 1][0]['observation']['geese'][ii]:
-                geese[ii].cs[i - 1].r -= (75 + 25 * len(steps[i - 1][0]['observation']['geese'][ii])) * NUM_SCALE
+                geese[ii].cs[i - 1].r -= 100 * NUM_SCALE
 
     dat = list()
 
     for goose in geese:
         for c in goose.cs[:-1]:
             c.ss = True
+        
+        if goose.cs[-1].r >= 0.:
+            goose.cs[-1].r /= (1. - NUM_LAMBDA) * 2.
         
         dat.extend(goose.cs)
     
@@ -341,7 +361,7 @@ class ProgCallback(tf.keras.callbacks.Callback):
         self.pbar.update()
 
 class MyDataset:
-    def __init__(self, total, pool, shapes, batch_size=2048):
+    def __init__(self, total, pool, shapes, batch_size=512):
         self.total = total
         self.pool = pool
         self.shapes = shapes
@@ -351,7 +371,7 @@ class MyDataset:
         indexs = np.arange(self.total)
         np.random.shuffle(indexs)
 
-        stride = (NUM_GRID[0] * NUM_GRID[1] * NUM_CHANNEL * 1, 1, 2, 4)
+        stride = (NUM_GRID[0] * NUM_GRID[1] * NUM_CHANNEL * 1, 1, 4, 4)
 
         s_sm = shared_memory.SharedMemory(name='s_sm')
         ss_sm = shared_memory.SharedMemory(name='ss_sm')
@@ -365,13 +385,13 @@ class MyDataset:
                 X = np.empty((len(index), *self.shapes[0]), dtype=np.int8)
                 XX = np.empty((len(index), *self.shapes[0]), dtype=np.int8)
                 ss = np.empty((len(index), *self.shapes[1]), dtype=bool)
-                r = np.empty((len(index), *self.shapes[2]), dtype=np.float16)
+                r = np.empty((len(index), *self.shapes[2]), dtype=np.float32)
                 a = np.empty((len(index), *self.shapes[3]), dtype=np.int32)
 
                 for i, ii in enumerate(index):
                     X[i,] = np.ndarray(self.shapes[0], dtype=np.int8, buffer=s_sm.buf[stride[0] * ii:stride[0] * (ii + 1)])
                     ss[i,] = np.ndarray(self.shapes[1], dtype=bool, buffer=ss_sm.buf[stride[1] * ii:stride[1] * (ii + 1)])
-                    r[i,] = np.ndarray(self.shapes[2], dtype=np.float16, buffer=r_sm.buf[stride[2] * ii:stride[2] * (ii + 1)])
+                    r[i,] = np.ndarray(self.shapes[2], dtype=np.float32, buffer=r_sm.buf[stride[2] * ii:stride[2] * (ii + 1)])
                     a[i,] = np.ndarray(self.shapes[3], dtype=np.int32, buffer=a_sm.buf[stride[3] * ii:stride[3] * (ii + 1)])
 
                     if ss[i][0]:
@@ -389,7 +409,7 @@ class MyDataset:
     def new(self):
         return tf.data.Dataset.from_generator(
             self._generator,
-            output_types=('int8', 'int8', 'bool', 'float16', 'int32'), 
+            output_types=('int8', 'int8', 'bool', 'float32', 'int32'), 
             output_shapes=((None, *self.shapes[0]), (None, *self.shapes[0]), (None, *self.shapes[1]), (None, *self.shapes[2]), (None, *self.shapes[3]))
         )
 
@@ -424,16 +444,16 @@ if __name__ == '__main__':
 
     pool = ProcessPool(mp.cpu_count())
 
-    critic = Critic([512, 256, 256, 128], NUM_ACT, STOCK_X)
+    critic = Critic([64, 64, 64, 64, 64], NUM_ACT, STOCK_X)
     critic(critic.stock)
 
     if GEN_ENDED_AT >= 0:
         with open(f'ddrive/{GEN_ENDED_AT}.txt', 'rb') as f:
-            weights = pickle.loads(lzma.decompress(f.read()))
+            weights = pickle.loads(lzma.decompress(base64.b85decode(f.read())))
 
         critic.set_weights(weights)
 
-    critic.compile(optimizer=tf.keras.optimizers.SGD(0.1), loss=tf.keras.losses.Huber(10))
+    critic.compile(optimizer=tf.keras.optimizers.SGD(0.04), loss='mse')
 
     cg = CellGroup()
     
@@ -462,7 +482,6 @@ if __name__ == '__main__':
         total = cg.cl + 1
 
         dat = MyDataset(total, pool, [(*NUM_GRID, NUM_CHANNEL), (1,), (1,), (1,)]).new()
-        dat = dat.prefetch(tf.data.AUTOTUNE)
 
         print('Processing Data Complete.')
         print("Training...")
@@ -477,7 +496,7 @@ if __name__ == '__main__':
         print("Training Complete.")
 
         with open(f'ddrive/{gen}.txt', 'wb') as f:
-            f.write(lzma.compress(pickle.dumps(critic.get_weights()), preset=9))
+            f.write(base64.b85encode(lzma.compress(pickle.dumps([arr.astype(np.float16) for arr in critic.get_weights()]), preset=9)))
 
         pool.close()
         pool.join()

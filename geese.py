@@ -20,16 +20,15 @@ from kaggle_environments.envs.hungry_geese.hungry_geese import Action
 from kaggle_environments import make
 
 NUM_GRID = (7, 11)
-NUM_CHANNEL = 7
+NUM_CHANNEL = 8
 NUM_ACT = 4
 NUM_GEESE = 4
     
 GAME_PER_GEN = 512
 NUM_REPLAY_BUF = 2
 
-NUM_LAMBDA = 0.95
+NUM_LAMBDA = 0.9
 NUM_RAND = 1
-NUM_SCALE = 0.1
 
 STOCK_X = tf.convert_to_tensor(np.zeros((*NUM_GRID, NUM_CHANNEL)), dtype='int8')
 STOCK_ACT = [Action(i + 1) for i in range(NUM_ACT)]
@@ -245,9 +244,9 @@ def run_game(weights):
 
         for ii, goose in enumerate(obs['geese']):
             if goose:
-                geese[ii].cs[i - 1].r += (1 + len(goose)) * NUM_SCALE
+                geese[ii].cs[i - 1].r += 1 + len(goose)
             elif steps[i - 1][0]['observation']['geese'][ii]:
-                geese[ii].cs[i - 1].r -= 100 * NUM_SCALE
+                geese[ii].cs[i - 1].r -= 10
 
     dat = list()
 
@@ -291,6 +290,14 @@ def obs_to_x(obs, acts):
         r = (r + rc) % NUM_GRID[0]
         c = (c + cc) % NUM_GRID[1]
 
+        x[r][c][7] = 1
+        
+    for block in geese[index]:
+        r, c = pos_to_coord(block)
+        
+        r = (r + rc) % NUM_GRID[0]
+        c = (c + cc) % NUM_GRID[1]
+        
         x[r][c][6] = 1
 
     for i, goose in enumerate(geese):
@@ -401,7 +408,7 @@ if __name__ == '__main__':
 
         critic.set_weights(weights)
 
-    critic.compile(optimizer=tf.keras.optimizers.SGD(0.04), loss=tf.keras.losses.Huber(16))
+    critic.compile(optimizer=tf.keras.optimizers.SGD(0.001), loss='mse')
 
     cg = CellGroup()
     
@@ -422,14 +429,15 @@ if __name__ == '__main__':
         print('Running Games Complete.')
         print('Processing Data...')
 
-        cg.add(cs)
-
-        if len(cg.cs) > NUM_REPLAY_BUF:
+        if len(cg.cs) == NUM_REPLAY_BUF:
             cg.pop()
+        
+        cg.add(cs)
 
         total = cg.cl + 1
 
         dat = MyDataset(cg.s, cg.ss, cg.r, cg.a, total, [(*NUM_GRID, NUM_CHANNEL), (1,), (1,), (1,)]).new()
+        dat = dat.prefetch(tf.data.AUTOTUNE)
 
         print('Processing Data Complete.')
         print("Training...")

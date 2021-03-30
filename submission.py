@@ -10,7 +10,7 @@ import lzma
 from kaggle_environments.envs.hungry_geese.hungry_geese import Action
 
 NUM_GRID = (7, 11)
-NUM_CHANNEL = 8
+NUM_CHANNEL = 11
 NUM_ACT = 4
 
 STOCK_X = tf.zeros((*NUM_GRID, NUM_CHANNEL), dtype='int8')
@@ -103,18 +103,12 @@ def obs_to_x(obs, acts):
         r = (r + rc) % NUM_GRID[0]
         c = (c + cc) % NUM_GRID[1]
 
-        x[r][c][7] = 1
-        
-    for block in geese[index]:
-        r, c = pos_to_coord(block)
-        
-        r = (r + rc) % NUM_GRID[0]
-        c = (c + cc) % NUM_GRID[1]
-        
-        x[r][c][6] = 1
+        x[r][c][10] = 1
 
     for i, goose in enumerate(geese):
         if goose:
+            iii = (i - index) % 4
+            
             r, c = pos_to_coord(goose[0])
             
             r = (r + rc) % NUM_GRID[0]
@@ -149,6 +143,7 @@ def obs_to_x(obs, acts):
 
                 x[r][c][4] = 1
                 x[r][c][d] = 1
+                x[r][c][6 + iii] = 1
     
     return tf.convert_to_tensor(x, dtype='int8')
 
@@ -157,7 +152,7 @@ weights = b'{Wp48S^xk9=GL@E0stWa8~^|S5YJf5;R>1W{#^h-0LMw!fS{rUv%i!_gd~s$Ve^_tRbd
 weights = pickle.loads(lzma.decompress(base64.b85decode(weights)))
 weights = [arr.astype(np.float32) for arr in weights]
 
-critic = Net([64, 64, 64, 64, 64], NUM_ACT, STOCK_X)
+critic = Net([64, 64, 64, 64, 32, 32, 32, 32], NUM_ACT, STOCK_X)
 critic(critic.stock)
 critic.set_weights(weights)
 

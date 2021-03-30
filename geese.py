@@ -24,11 +24,11 @@ NUM_CHANNEL = 8
 NUM_ACT = 4
 NUM_GEESE = 4
     
-GAME_PER_GEN = 512
-NUM_REPLAY_BUF = 2
+GAME_PER_GEN = 400
+NUM_REPLAY_BUF = 3
 
-NUM_LAMBDA = 0.9
-NUM_RAND = 1
+NUM_LAMBDA = 0.95
+NUM_RAND = 10
 
 STOCK_X = tf.convert_to_tensor(np.zeros((*NUM_GRID, NUM_CHANNEL)), dtype='int8')
 STOCK_ACT = [Action(i + 1) for i in range(NUM_ACT)]
@@ -136,10 +136,12 @@ class Cell:
 
 class CellGroup:
     def __init__(self, create=True, cs=None):
-        self.s = np.ndarray((819200, *NUM_GRID, NUM_CHANNEL), dtype=np.int8)
-        self.ss = np.ndarray((819200, 1), dtype=bool)
-        self.r = np.ndarray((819200, 1), dtype=np.float32)
-        self.a = np.ndarray((819200, 1), dtype=np.int32)
+        i = GAME_PER_GEN * NUM_REPLAY_BUF * NUM_GEESE * 200
+        
+        self.s = np.ndarray((i, *NUM_GRID, NUM_CHANNEL), dtype=np.int8)
+        self.ss = np.ndarray((i, 1), dtype=bool)
+        self.r = np.ndarray((i, 1), dtype=np.float32)
+        self.a = np.ndarray((i, 1), dtype=np.int32)
 
         if create:
             self.cs = list()
@@ -228,7 +230,7 @@ class Goose:
         return STOCK_ACT[i].name
 
 def run_game(weights):
-    critic = Critic([64, 64, 64, 64, 64], NUM_ACT, STOCK_X)
+    critic = Critic([64, 64, 64, 64, 32, 32, 32, 32, 16, 16], NUM_ACT, STOCK_X)
     critic(critic.stock)
     critic.set_weights(pickle.loads(weights))
         
@@ -297,7 +299,7 @@ def obs_to_x(obs, acts):
         
         r = (r + rc) % NUM_GRID[0]
         c = (c + cc) % NUM_GRID[1]
-        
+
         x[r][c][6] = 1
 
     for i, goose in enumerate(geese):
@@ -399,7 +401,7 @@ if __name__ == '__main__':
 
     pool = ProcessPool(mp.cpu_count())
 
-    critic = Critic([64, 64, 64, 64, 64], NUM_ACT, STOCK_X)
+    critic = Critic([64, 64, 64, 64, 32, 32, 32, 32, 16, 16], NUM_ACT, STOCK_X)
     critic(critic.stock)
 
     if GEN_ENDED_AT >= 0:
@@ -408,7 +410,7 @@ if __name__ == '__main__':
 
         critic.set_weights(weights)
 
-    critic.compile(optimizer=tf.keras.optimizers.SGD(0.001), loss='mse')
+    critic.compile(optimizer=tf.keras.optimizers.SGD(0.0001), loss='mse')
 
     cg = CellGroup()
     
